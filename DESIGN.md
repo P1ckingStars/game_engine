@@ -17,15 +17,16 @@ milestone plan.
 | Ray tracing | **Native (hardware)** via `VK_KHR` RT; start with inline `ray_query` | Drives the RDNA3 Ray Accelerators; `ray_query` is the simpler entry point before the full RT pipeline |
 | Renderer | **Pure path tracer** (no rasterizer) | Single clean path and a true RT showcase; accepts heavier reliance on denoising/temporal on the iGPU |
 | Scene model | **ECS via EnTT** — designed & owned by Arthur | Data-oriented; pairs naturally with GPU buffers. Renderer reads from it via a clean interface. |
+| RHI | **Thin Vulkan wrapper that evolves** (single backend) | Tame boilerplate without speculative multi-backend architecture; extract more only when a second use appears |
+| Denoising/temporal | **Architect for it early, deliver in stages** | Reserve buffers/frame-graph from the first RT milestone; implement basic PT → temporal accumulation → spatial denoiser in that order |
 | Target HW | Linux · AMD RDNA3 Radeon 780M (RADV) | Has hardware RT; iGPU → modest perf, so dev/learning focus |
 
 **Code split:** host code (C++/Vulkan) orchestrates — resources, BLAS/TLAS builds, dispatch,
 sync, present; device code (GLSL compute shaders) *is* the path tracer — ray gen, bounce loop
 with `rayQuery`, shading, sampling, accumulation.
 
-**Still open:** (1) RHI abstraction level — thin-and-evolving (recommended) vs designed-up-front
-vs raw Vulkan; (2) whether denoising + temporal accumulation are built **core-from-the-start**
-(recommended for pure PT on an iGPU) or deferred until a basic noisy tracer works.
+**Now resolved (see §3.5, §4.3):** RHI → **thin Vulkan wrapper that evolves**; denoising/temporal
+→ **architected-for early, delivered in stages** (basic PT → accumulation → denoiser).
 
 ---
 
@@ -112,6 +113,15 @@ vs raw Vulkan; (2) whether denoising + temporal accumulation are built **core-fr
   - (A hybrid raster+RT path is *not* planned; if real-time perf on the iGPU forces it, it can be
     reconsidered, but the design target is pure PT.)
 
+### 3.5 RHI: **thin Vulkan wrapper that evolves** (single backend)
+- Build a *minimal* abstraction — `Device`, `Buffer`, `Image`, `Pipeline`, `CommandList`, plus
+  acceleration-structure / `rayQuery` helpers — sized to keep path-tracer code readable.
+- **Keep it Vulkan-shaped and single-backend.** Wrap the boilerplate, but do *not* hide concepts
+  we genuinely need to control (barriers, memory types, sync). No speculative DX12/Metal layer.
+- **Extract new abstractions only when a second real use appears** — matches "build it, then
+  extract the engine." Avoids both raw-Vulkan boilerplate sprawl in the renderer and up-front
+  architecture for backends that don't exist.
+
 ---
 
 ## 4. Ray tracing architecture (the renderer core)
@@ -157,6 +167,19 @@ vs raw Vulkan; (2) whether denoising + temporal accumulation are built **core-fr
 - **Temporal reuse** (accumulation / reprojection / ReSTIR) and **denoising** to get a clean
   image from few samples. **Async compute** to overlap heterogeneous passes (e.g. denoise on
   compute/tensor-style units while traversal runs on RT units).
+
+#### Denoising/temporal plan: architect early, deliver in stages
+This is structurally invasive, so we **reserve the architecture from the first RT milestone**
+even though we implement it later:
+- **Reserve up front:** render into an offscreen **HDR accumulation target with ping-pong
+  history**, and have the path tracer emit **auxiliary buffers from the primary hit** (depth,
+  normal, albedo, motion vectors). Both temporal reprojection and SVGF-style denoising need
+  these; adding them early is cheap, retrofitting is painful.
+- **Deliver in order:** (1) basic *noisy* path tracer first (need an image before denoising it);
+  (2) **temporal accumulation** next (highest value / lowest cost — a static-camera accumulator
+  converges immediately); (3) a **spatial denoiser** (À-Trous / SVGF-style) as a self-contained
+  pass. No off-the-shelf vendor denoiser (e.g. NVIDIA OptiX) on AMD, so this is our own / an open
+  implementation.
 
 ### 4.4 Why dedicated RT hardware is required (design rationale)
 - BVH traversal is branchy, pointer-chasing, **divergent** work: rays in a warp take different
@@ -239,9 +262,6 @@ Engine extraction:
 ---
 
 ## 8. Open questions / decisions deferred
-- **RHI abstraction level** — thin-and-evolving (recommended) vs designed-up-front vs raw Vulkan.
-- **Denoising + temporal accumulation timing** — core-from-the-start (recommended for pure PT on
-  an iGPU) vs deferred until a basic noisy tracer renders.
 - glTF (hand-parse to understand the data) vs. Assimp (convenience) for model loading.
 - When to migrate from `ray_query` to the full RT pipeline.
 - HLSL vs. GLSL for shader authoring (default GLSL).
@@ -251,3 +271,5 @@ Engine extraction:
 - GPU kernels → **Vulkan compute shaders**, not OpenCL/CUDA.
 - Rendering model → **pure path tracer** (no rasterizer).
 - Scene model → **ECS via EnTT**, owned by Arthur.
+- RHI → **thin Vulkan wrapper that evolves**, single backend (§3.5).
+- Denoising/temporal → **architected-for early, delivered in stages** (§4.3).
