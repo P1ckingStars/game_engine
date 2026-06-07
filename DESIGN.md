@@ -19,6 +19,7 @@ milestone plan.
 | Scene model | **ECS via EnTT** — designed & owned by Arthur | Data-oriented; pairs naturally with GPU buffers. Renderer reads from it via a clean interface. |
 | RHI | **Thin Vulkan wrapper that evolves** (single backend) | Tame boilerplate without speculative multi-backend architecture; extract more only when a second use appears |
 | Denoising/temporal | **Architect for it early, deliver in stages** | Reserve buffers/frame-graph from the first RT milestone; implement basic PT → temporal accumulation → spatial denoiser in that order |
+| Engine↔renderer API | **Extract to neutral types; zero-copy buffer fill; snapshot** | Engine writes neutral `InstanceDesc` straight into a renderer-provided mapped buffer (true zero-copy on the shared-memory iGPU); renderer converts to Vulkan format on-GPU. Engine has no Vulkan, renderer has no EnTT. (§5) |
 | Target HW | Linux · AMD RDNA3 Radeon 780M (RADV) | Has hardware RT; iGPU → modest perf, so dev/learning focus |
 
 **Code split:** host code (C++/Vulkan) orchestrates — resources, BLAS/TLAS builds, dispatch,
@@ -193,7 +194,102 @@ even though we implement it later:
 
 ---
 
-## 5. Engine subsystems (beyond the renderer)
+## 5. Engine ↔ Renderer API contract
+
+The most important internal boundary. **Engine core never touches Vulkan; renderer never touches
+EnTT.** The only vocabulary between them is a small set of neutral POD types plus a registration +
+per-frame submission API.
+
+**Interaction model: extract.** Each frame the engine walks its EnTT registry and writes a
+renderer-neutral snapshot; the renderer consumes it. The renderer includes no EnTT headers; the
+engine includes no Vulkan types.
+
+### 5.1 Layer 1 — Resource registration (infrequent: on asset load)
+Geometry/materials/textures are registered **once**; the renderer uploads them to the GPU and
+builds a **BLAS** per mesh, returning an opaque handle (the "build once" half). The vertex/index
+buffers serve **both** the BLAS build and in-shader surface fetch.
+
+```cpp
+struct MeshHandle     { uint32_t id; };
+struct MaterialHandle { uint32_t id; };
+struct TextureHandle  { uint32_t id; };   // id==0 == none
+
+struct Vertex { vec3 pos; vec3 normal; vec2 uv; vec4 tangent; };
+
+struct MeshDesc {
+    std::span<const Vertex>   vertices;
+    std::span<const uint32_t> indices;
+    bool deformable = false;          // true → fast-build BLAS, refit via updateMesh
+};
+struct MaterialDesc {
+    vec3 baseColor{1,1,1}; float metallic=0, roughness=1; vec3 emission{0,0,0};
+    TextureHandle albedo{}, normalMap{}, metalRough{};
+};
+struct TextureDesc { const void* pixels; uint32_t w, h; Format fmt; };
+
+MeshHandle     registerMesh(const MeshDesc&);
+MaterialHandle registerMaterial(const MaterialDesc&);
+TextureHandle  registerTexture(const TextureDesc&);
+void           updateMesh(MeshHandle, std::span<const Vertex>);   // deformables → BLAS refit
+void           release(MeshHandle /* + overloads */);
+```
+
+### 5.2 Layer 2 — Per-frame submission (every frame: zero-copy fill)
+**Snapshot style** (not delta): the engine submits the full instance set each frame and the
+renderer rebuilds the cheap TLAS. Delta only saves *scene-description* cost at large scale and
+adds stateful complexity — the path tracer re-traces the whole frame regardless (camera motion +
+temporal accumulation + global illumination mean there is no "unchanged region" to skip). The door
+stays open to delta later as a pure submission-layer optimization.
+
+**Zero-copy buffer fill:** the renderer hands the engine a writable span into its own
+**persistently-mapped, double-buffered** instance buffer; the engine's extraction writes straight
+in — no engine-side array, no copy.
+
+**iGPU bonus:** on the 780M, host-visible memory *is* device-local (shared memory), so this is
+**true zero-copy** — the CPU writes the same physical memory the GPU reads, with no staging
+transfer (which a discrete card would require).
+
+**Format conversion stays on-GPU:** the engine writes neutral `InstanceDesc`; a renderer compute
+pass expands these into `VkAccelerationStructureInstanceKHR` + per-instance shading records for the
+TLAS build — so the Vulkan instance format never crosses the boundary.
+
+```cpp
+struct CameraDesc { vec3 position; quat orientation; float vFovRad, aspect, nearZ, farZ; };
+
+struct InstanceDesc {              // renderer-defined POD (no Vulkan types)
+    MeshHandle mesh; MaterialHandle material;
+    mat4 transform;                // world transform THIS frame
+    uint64_t stableId;             // persistent per-object id → motion vectors
+};
+struct LightDesc { enum Type {Directional,Point,Spot} type; vec3 dir,pos,color; float intensity,radius; };
+struct EnvironmentDesc { TextureHandle envMap; float intensity; vec3 tint; };
+
+// Per-frame, zero-copy:
+FrameBuilder fb = renderer.beginFrame();          // picks the right double-buffer
+std::span<InstanceDesc> dst = fb.instances(maxN); // mapped GPU-visible memory
+size_t n = 0; /* engine ECS extraction writes dst[n++] = {...} */
+fb.setInstanceCount(n);
+fb.setCamera(cam); fb.setLights(lights); fb.setEnvironment(env);
+fb.setFrameIndex(idx); fb.setResetAccumulation(cameraCut);
+renderer.submit(fb, target);
+```
+
+### 5.3 Cross-cutting contracts
+- **Vulkan ownership:** entirely the renderer. Only CPU-side data + opaque handles cross over.
+- **Motion vectors:** the renderer tracks previous transforms keyed by `InstanceDesc::stableId`.
+  The engine only keeps `stableId` stable and sets `resetAccumulation` on camera cuts.
+- **Static vs deformable:** `MeshDesc::deformable` sets BLAS build flags; `updateMesh()` refits
+  deformables; **rigid motion needs neither** — just a new `transform` in `InstanceDesc`
+  (TLAS-only update).
+- **Write-combined memory:** the engine writes the instance span **linearly, forward, no
+  read-back**.
+- **Double-buffering** (frames in flight) is the renderer's job, hidden behind `beginFrame()`.
+- **Lifetime:** the `FrameBuilder` and its spans are valid until `submit()`; that call is the
+  synchronization point.
+
+---
+
+## 6. Engine subsystems (beyond the renderer)
 
 Sequenced roughly by when they're needed:
 
@@ -213,7 +309,7 @@ Sequenced roughly by when they're needed:
 
 ---
 
-## 6. Dependencies & tooling
+## 7. Dependencies & tooling
 
 - **Build:** CMake (+ vcpkg or system packages for deps).
 - **Vulkan:** Vulkan SDK / loader, validation layers, RADV driver (`vulkan-radeon`),
@@ -231,7 +327,7 @@ vulkaninfo | grep -iE 'deviceName|driverName'
 
 ---
 
-## 7. Milestone ladder
+## 8. Milestone ladder
 
 Rendering foundation (the LearnOpenGL/vulkan-tutorial curriculum, in Vulkan):
 
@@ -261,7 +357,7 @@ Engine extraction:
 
 ---
 
-## 8. Open questions / decisions deferred
+## 9. Open questions / decisions deferred
 - glTF (hand-parse to understand the data) vs. Assimp (convenience) for model loading.
 - When to migrate from `ray_query` to the full RT pipeline.
 - HLSL vs. GLSL for shader authoring (default GLSL).
@@ -273,3 +369,5 @@ Engine extraction:
 - Scene model → **ECS via EnTT**, owned by Arthur.
 - RHI → **thin Vulkan wrapper that evolves**, single backend (§3.5).
 - Denoising/temporal → **architected-for early, delivered in stages** (§4.3).
+- Engine↔renderer API → **extract model, zero-copy buffer fill, snapshot submission**; motion
+  vectors tracked renderer-side via `stableId` (§5).
