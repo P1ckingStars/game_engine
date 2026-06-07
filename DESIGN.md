@@ -6,6 +6,29 @@ milestone plan.
 
 ---
 
+## Decisions at a glance (confirmed)
+
+| Area | Decision | Rationale |
+|------|----------|-----------|
+| Language | **C++** | Industry standard for engines; max control & learning value |
+| Dimensionality | **3D** | — |
+| Graphics + compute API | **Vulkan** | Only cross-platform API exposing hardware RT; one API for graphics + compute + present. Portable — also runs on NVIDIA/Intel, so not AMD lock-in. |
+| GPU kernels | **Vulkan compute shaders** (GLSL → SPIR-V) — *not* OpenCL or CUDA | Only path that can both invoke hardware ray tracing *and* share resources with rendering/presentation. OpenCL/CUDA are peer compute APIs that can't do RT or present. |
+| Ray tracing | **Native (hardware)** via `VK_KHR` RT; start with inline `ray_query` | Drives the RDNA3 Ray Accelerators; `ray_query` is the simpler entry point before the full RT pipeline |
+| Renderer | **Pure path tracer** (no rasterizer) | Single clean path and a true RT showcase; accepts heavier reliance on denoising/temporal on the iGPU |
+| Scene model | **ECS via EnTT** — designed & owned by Arthur | Data-oriented; pairs naturally with GPU buffers. Renderer reads from it via a clean interface. |
+| Target HW | Linux · AMD RDNA3 Radeon 780M (RADV) | Has hardware RT; iGPU → modest perf, so dev/learning focus |
+
+**Code split:** host code (C++/Vulkan) orchestrates — resources, BLAS/TLAS builds, dispatch,
+sync, present; device code (GLSL compute shaders) *is* the path tracer — ray gen, bounce loop
+with `rayQuery`, shading, sampling, accumulation.
+
+**Still open:** (1) RHI abstraction level — thin-and-evolving (recommended) vs designed-up-front
+vs raw Vulkan; (2) whether denoising + temporal accumulation are built **core-from-the-start**
+(recommended for pure PT on an iGPU) or deferred until a basic noisy tracer works.
+
+---
+
 ## 1. Goals & scope
 
 - **Language:** C++ (industry standard for engine work; maximum control and learning value).
@@ -50,6 +73,9 @@ milestone plan.
   Metal (Apple-only). For a from-scratch Linux engine, **Vulkan** is the choice.
 - Consequence: we accept Vulkan's steep boilerplate up front rather than building on OpenGL and
   rewriting the renderer later.
+- **Portability bonus:** Vulkan is cross-vendor. The same KHR-RT code runs on NVIDIA (RT cores)
+  and Intel (RTUs) as well as our AMD Ray Accelerators — choosing Vulkan is the *opposite* of
+  vendor lock-in, and the engine will run (likely faster) on a discrete NVIDIA/AMD card.
 
 ### 3.2 RT entry point: **ray queries first**, full RT pipeline later
 - **Ray queries (inline RT, `VK_KHR_ray_query`)**: trace hardware rays from inside an ordinary
@@ -63,14 +89,28 @@ milestone plan.
 - **HIP/ROCm** (AMD's CUDA-equivalent) does not officially support this RDNA 3 iGPU (`gfx1103`);
   only fragile env-override hacks. Not a foundation to build on.
 - **Vulkan compute** is the most reliable compute path on this iGPU on Linux **and** is the same
-  stack as our RT — one toolchain for both compute kernels and ray tracing. (OpenCL and SYCL are
-  available fallbacks for general compute if needed.)
+  stack as our RT — one toolchain for both compute kernels and ray tracing.
+- **Our GPU kernels are Vulkan compute shaders** (GLSL → SPIR-V), *not* OpenCL/CUDA kernels.
+  "GPU kernel" is a generic concept; OpenCL, CUDA, and Vulkan compute shaders are all ways to
+  write one (compute world says "kernel", graphics world says "shader" — same thing). We use
+  compute shaders because they are the only kernels that can invoke `rayQuery` (hardware RT) and
+  natively share buffers/images with the renderer and swapchain. OpenCL is a *peer* API (same
+  stack level, neither calls the other) that is compute-only — it can't trace rays or present —
+  so we don't use it. (OpenCL/SYCL remain available only as fallbacks for non-RT general compute.)
 
-### 3.4 Rendering model: **hybrid**, separable from the engine
+### 3.4 Rendering model: **pure path tracer**, separable from the engine
 - The renderer is the *only* subsystem that fundamentally cares about RT. Scene management, ECS,
-  asset loading, input, audio, physics are identical whether we rasterize or ray trace.
-- Plan for **hybrid rendering**: rasterize the main scene, use RT for the expensive-to-fake
-  effects (reflections, shadows, ambient occlusion, global illumination).
+  asset loading, input, audio, physics are identical regardless of the rendering method.
+- **Decision: pure path tracing — no rasterizer.** *Everything*, including primary camera
+  visibility, is ray-traced. Cleaner single code path and a true RT showcase.
+- **Implications we accept:**
+  - The TLAS must cover **all visible geometry every frame** (primary visibility uses it too) —
+    the acceleration-structure build is on the critical path for everything.
+  - **Noise is the main enemy on the 780M.** With few samples-per-pixel the raw image is grainy,
+    so **temporal accumulation + denoising carry the real-time burden** and are promoted toward
+    first-class (see open question on timing in the Decisions summary).
+  - (A hybrid raster+RT path is *not* planned; if real-time perf on the iGPU forces it, it can be
+    reconsidered, but the design target is pure PT.)
 
 ---
 
@@ -140,7 +180,10 @@ Sequenced roughly by when they're needed:
 4. **Renderer** — Vulkan core, then the RT path above.
 5. **Asset loading** — images (stb_image), 3D models (glTF/Assimp).
 6. **Debug UI** — Dear ImGui (added early; basis for a future editor).
-7. **Scene organization** — ECS (EnTT, or a hand-rolled one to learn).
+7. **Scene organization** — **ECS via EnTT, designed & owned by Arthur.** The engine core exposes
+   the ECS; the renderer only *reads* it each frame. Contract: iterate entities with
+   `{ mesh handle, material, world transform }` → renderer packs them into GPU buffers + TLAS
+   instances. The renderer is built to this interface and stays out of the ECS design.
 8. **Physics/collision** — integrate Jolt or Bullet later.
 9. **Audio** — a library (OpenAL / miniaudio) later.
 10. **Serialization & scripting** — later (e.g. Lua via sol2).
@@ -196,8 +239,15 @@ Engine extraction:
 ---
 
 ## 8. Open questions / decisions deferred
-- ECS vs. traditional scene-graph for the first engine (lean ECS / EnTT).
+- **RHI abstraction level** — thin-and-evolving (recommended) vs designed-up-front vs raw Vulkan.
+- **Denoising + temporal accumulation timing** — core-from-the-start (recommended for pure PT on
+  an iGPU) vs deferred until a basic noisy tracer renders.
 - glTF (hand-parse to understand the data) vs. Assimp (convenience) for model loading.
-- When to migrate from ray queries to the full RT pipeline.
-- HLSL vs. GLSL for shader authoring.
-- When (if) to add a second backend (DX12/Vulkan portability layer).
+- When to migrate from `ray_query` to the full RT pipeline.
+- HLSL vs. GLSL for shader authoring (default GLSL).
+
+### Resolved this session
+- Graphics + compute API → **Vulkan** (cross-vendor; the one stack for graphics + compute + RT).
+- GPU kernels → **Vulkan compute shaders**, not OpenCL/CUDA.
+- Rendering model → **pure path tracer** (no rasterizer).
+- Scene model → **ECS via EnTT**, owned by Arthur.
